@@ -118,7 +118,7 @@ def generate_grpo(
                     expanded_prompts[prompt_idx],
                     model,
                     max_tokens=max_tokens,
-                    sampler=lambda x: mx.random.categorical(x / temperature),
+                    sampler=(lambda x: mx.random.categorical(x / temperature)),
                     prompt_cache=prompt_cache,
                 ):
                     if token == tokenizer.eos_token_id:
