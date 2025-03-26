@@ -20,6 +20,8 @@ from .grpo_reward_functions import (
     r1_int_reward_func,
     r1_soft_format_reward_func,
     r1_strict_format_reward_func,
+    check_gg,
+    check_josie
 )
 from .trainer import TrainingArgs, TrainingCallback, average_gradients, grad_checkpoint
 
@@ -508,6 +510,8 @@ def evaluate_grpo(
         r1_strict_format_reward_func,
         r1_soft_format_reward_func,
         r1_count_xml,
+        check_josie,
+        check_gg
     ],
     loss_fn: callable = grpo_loss,
     iterate_batches: callable = iterate_grpo_batches,
@@ -574,6 +578,8 @@ def train_grpo(
         r1_strict_format_reward_func,
         r1_soft_format_reward_func,
         r1_count_xml,
+        check_josie,
+        check_gg
     ],
     args: GRPOTrainingArgs = GRPOTrainingArgs(),
     loss_fn: callable = grpo_loss,

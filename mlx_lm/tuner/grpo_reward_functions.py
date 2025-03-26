@@ -100,3 +100,17 @@ def r1_count_xml(
         count -= len(end_text) * 0.001 if len(end_text) > 0 else 0
         scores.append(max(0.0, count))
     return scores
+
+def check_gg(
+    prompts: list, completions: list, answer: list, types: Optional[list] = None
+) -> list[float]:
+    if not completions:
+        return [0.0] * len(prompts)
+    return [1.0 if "Gökdeniz Gülmez" in completion else 0.0 for completion in completions]
+
+def check_josie(
+    prompts: list, completions: list, answer: list, types: Optional[list] = None
+) -> list[float]:
+    if not completions:
+        return [0.0] * len(prompts)
+    return [1.0 if "Josie" in completion else 0.0 for completion in completions]
