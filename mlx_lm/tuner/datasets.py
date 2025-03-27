@@ -12,7 +12,7 @@ class OnlineDPODataset:
     A dataset for Online DPO training that supports both raw string prompts and structured prompts.
     Prompt formats supported:
     1. Raw string: "prompt": "text"
-    2. Structured: "prompt": [{"content": "text", "role": "user"}]
+    2. Structured: "prompt": [{"content": "text", "role": "system"}, {"content": "text", "role": "user"}]
     """
 
     def __init__(
@@ -20,11 +20,11 @@ class OnlineDPODataset:
         data: List[Dict[str, Any]],
         tokenizer: PreTrainedTokenizer,
         mask_prompt: bool = False,
-        text_key: str = "prompt"
+        prompt_key: str = "prompt"
     ):
         self._data = []
         for d in data:
-            prompt = d[text_key]
+            prompt = d[prompt_key]
             
             if isinstance(prompt, str):
                 messages = [{"role": "user", "content": prompt}]

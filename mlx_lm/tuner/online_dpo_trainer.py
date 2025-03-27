@@ -3,6 +3,8 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 import time
+from abc import ABC, abstractmethod
+from typing import List, Union, Optional, Tuple, Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -16,6 +18,142 @@ from .trainer import grad_checkpoint, TrainingArgs
 
 @dataclass
 class OnlineDPOTrainingArgs(TrainingArgs):
+    beta: float = field(
+        default=0.1, metadata={"help": "Temperature parameter for DPO training."}
+    )
+    loss_type: str = field(
+        default="sigmoid",
+        metadata={"help": "DPO loss type: 'sigmoid', 'hinge', 'ipo', or 'dpop'."},
+    )
+    delta: float = field(
+        default=50.0, metadata={"help": "Delta parameter for DPOP loss type."}
+    )
+    judge: str = field(
+        default=None,
+        metadata={
+            "help": "Judge. If None, can only be (PairRMJudge, human) default is PairRMJudge."
+        },
+    )
+
+
+class Judge(ABC):
+    def __init__(self, mode: str = "rank"):
+        """
+        Initialize the judge.
+        
+        Args:
+            mode (`str`, *optional*, defaults to `"rank"`):
+                The mode of the judge. Can be "rank", "pairwise", or "pairrm".
+        """
+        self.mode = mode
+        self.blender = None
+        
+        # Initialize PairRM if needed
+        if mode == "pairrm":
+            self._init_pairrm()
+    
+    def _init_pairrm(self):
+        """Initialize the PairRM model if needed."""
+        try:
+            import llm_blender
+            from accelerate import Accelerator
+            self.blender = llm_blender.Blender()
+            self.blender.loadranker("llm-blender/PairRM", device=Accelerator().device)
+        except ImportError:
+            raise ValueError("llm-blender is not installed. Please install it with `pip install llm-blender`.")
+    
+    @abstractmethod
+    def _judge_impl(self, prompts: List[str], completions: List[List[str]], 
+                   shuffle_order: bool = True, **kwargs) -> List[Any]:
+        """
+        Implementation method to be overridden by subclasses.
+        """
+        raise NotImplementedError("Judge subclasses must implement the `_judge_impl` method.")
+    
+    def judge(self, prompts: List[str], completions: List[List[str]], 
+             shuffle_order: bool = True, mode: Optional[str] = None, **kwargs) -> List[Any]:
+        """
+        Judge the completions for the given prompts.
+        
+        Args:
+            prompts (`List[str]`):
+                List of prompts.
+            completions (`List[List[str]]`):
+                List of completions for each prompt.
+            shuffle_order (`bool`, *optional*, defaults to `True`):
+                Whether to shuffle the order of the completions to avoid positional bias.
+            mode (`str`, *optional*):
+                Override the judge mode for this call. Can be "rank", "pairwise", or "pairrm".
+            **kwargs:
+                Additional arguments specific to the mode.
+                For "pairrm" mode:
+                - return_scores (`bool`): Return probability scores instead of ranks.
+                - temperature (`float`): Temperature for scaling logits if return_scores is True.
+        
+        Returns:
+            For "rank" mode:
+                `List[List[int]]`: List of lists of indices, where each list contains the ranks of the completions.
+            For "pairwise" mode:
+                `List[int]`: List of indices indicating the preferred completion (0 or 1) for each prompt.
+            For "pairrm" mode with return_scores=False:
+                `List[int]`: List of indices indicating the preferred completion (0 or 1) for each prompt.
+            For "pairrm" mode with return_scores=True:
+                `List[float]`: List of probability scores for the first completion.
+        """
+        # Use provided mode or fall back to instance mode
+        current_mode = mode if mode is not None else self.mode
+        
+        if current_mode == "pairrm":
+            return self._judge_pairrm(prompts, completions, shuffle_order, **kwargs)
+        elif hasattr(self, "_judge_impl"):
+            return self._judge_impl(prompts, completions, shuffle_order, mode=current_mode, **kwargs)
+        else:
+            raise NotImplementedError(f"No implementation available for mode: {current_mode}")
+    
+    def _judge_pairrm(self, prompts: List[str], completions: List[List[str]], 
+                     shuffle_order: bool = True, return_scores: bool = False, 
+                     temperature: float = 1.0) -> List[Union[int, float]]:
+        """
+        Judge using the PairRM model.
+        """
+        if self.blender is None:
+            self._init_pairrm()
+            
+        if any(len(pair) != 2 for pair in completions):
+            raise ValueError("PairRM judge requires exactly 2 completions per prompt.")
+            
+        # Shuffle the order of the completions to avoid positional bias
+        flip_mask = None
+        if shuffle_order:
+            flip_mask = np.random.choice([True, False], size=len(prompts))
+            completions = [pair[::-1] if flip else pair for flip, pair in zip(flip_mask, completions)]
+
+        # Rank the completions
+        ranks = self.blender.rank(prompts, completions, return_scores=return_scores, disable_tqdm=True)
+        if not return_scores:
+            ranks -= 1  # PairRM rank is 1-indexed, so we subtract 1 to make it 0-indexed
+        else:
+            # scale the logits by temperature
+            ranks /= temperature
+
+        # Flip back the ranks or scores to the original order if needed
+        if shuffle_order and flip_mask is not None:
+            if return_scores:
+                ranks[flip_mask] = ranks[flip_mask][:, ::-1]
+            else:
+                # For non-score ranks, we need to invert the result for flipped pairs
+                for i, flipped in enumerate(flip_mask):
+                    if flipped:
+                        ranks[i] = 1 - ranks[i]
+
+        # Return the ranks or score probability
+        if return_scores:
+            logit_max = np.amax(ranks, axis=-1, keepdims=True)
+            exp_logit_shifted = np.exp(ranks - logit_max)
+            probs = exp_logit_shifted / np.sum(exp_logit_shifted, axis=-1, keepdims=True)
+            return probs[:, 0].tolist()
+        else:
+            return ranks.tolist()
 
 
 def default_loss(model, batch, lengths):
