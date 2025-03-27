@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import time
 from abc import ABC, abstractmethod
-from typing import List, Union, Optional, Tuple, Any
+from typing import List, Union, Optional, Any
 
 import mlx.core as mx
 import mlx.nn as nn
