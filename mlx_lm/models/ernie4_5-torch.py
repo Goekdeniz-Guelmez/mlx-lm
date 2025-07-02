@@ -64,42 +64,12 @@ class Ernie4_5_RopeEmbedding(nn.Module):
 
 
 class Ernie4_5_FusedDropoutImpl(nn.Module):
-    """
-    Fused dropout implementation with residual connection support.
-
-    This layer combines dropout and residual addition in a single operation for better performance,
-    particularly on GPU devices. The dropout is conditionally applied based on the probability.
-
-    Args:
-        prob (float): Dropout probability (between 0 and 1)
-
-    Attributes:
-        prob (float): Stores the dropout probability
-        dropout (nn.Dropout): The actual dropout layer instance
-    """
-
     def __init__(self, prob):
-        """
-        Initialize the fused dropout layer.
-
-        Args:
-            prob (float): Dropout probability (0 means no dropout)
-        """
         super().__init__()
         self.prob = prob
         self.dropout = nn.Dropout(p=prob)
 
     def forward(self, x, y):
-        """
-        Forward pass of the fused dropout layer.
-
-        Args:
-            x (Tensor): Input tensor to potentially apply dropout
-            y (Tensor): Residual tensor to add to the (possibly dropped out) x
-
-        Returns:
-            Tensor: Result of x (with optional dropout) + y
-        """
         if self.prob > 0:
             x = self.dropout(x)
         output = x + y

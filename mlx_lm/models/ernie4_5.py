@@ -8,7 +8,7 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 
-# python -m mlx_lm.generate --model baidu/ERNIE-4.5-0.3B-Base-PT --prompt "The capital of France is" -m 20
+# python -m mlx_lm.generate --model baidu/ERNIE-4.5-0.3B-PT --prompt "The capital of France is" -m 20
 
 
 @dataclass
@@ -115,7 +115,7 @@ class Ernie4_5_FusedDropoutImpl(nn.Module):
         self.prob = prob
         self.dropout = nn.Dropout(p=prob)
 
-    def forward(self, x, y):
+    def __call__(self, x, y):
         if self.prob > 0:
             x = self.dropout(x)
         output = x + y
@@ -137,10 +137,8 @@ class Ernie4_5_DecoderLayer(nn.Module):
     def __call__(
         self, x: mx.array, mask: Optional[mx.array] = None, cache: Optional[Any] = None
     ) -> mx.array:
-        r = x + self.self_attn(self.input_layernorm(x), mask=mask, cache=cache)
-        x = self.residual_add1(x, r)
-        r = x + self.mlp(self.post_attention_layernorm(x))
-        x = self.residual_add2(x, r)
+        x = self.residual_add1(x, self.self_attn(self.input_layernorm(x), mask=mask, cache=cache))
+        x = self.residual_add2(x, self.mlp(self.post_attention_layernorm(x)))
         return x
 
 class Ernie4_5_Model(nn.Module):
@@ -158,7 +156,7 @@ class Ernie4_5_Model(nn.Module):
         mask: mx.array = None,
         cache=None,
     ):
-        h = self.embed_tokens(inputs) * self.embedding_multiplier
+        h = self.embed_tokens(inputs)
 
         if mask is None:
             mask = create_attention_mask(h, cache)
