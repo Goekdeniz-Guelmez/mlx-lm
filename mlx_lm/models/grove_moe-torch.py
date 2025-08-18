@@ -20,14 +20,6 @@ class Qwen3MoeMLP(nn.Module):
     def forward(self, x):
         return x
 
-
-class Qwen3MoeSparseMoeBlock(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-    def forward(self, hidden_states: torch.Tensor):
-        return hidden_states
-
-
 class GroveMoeSparseMoeBlock(nn.Module):
     def __init__(self, config):
         super().__init__()

@@ -6,9 +6,8 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .qwen3_moe import Attention, MLP, Qwen3MoeSparseMoeBlock
-from .switch_layers import SwitchGLU
+from .base import BaseModelArgs, create_attention_mask
+from .qwen3_moe import Attention, MLP
 
 
 @dataclass
