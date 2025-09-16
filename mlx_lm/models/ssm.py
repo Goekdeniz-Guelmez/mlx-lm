@@ -60,7 +60,71 @@ def make_ssm_kernel():
     )
 
 
+def make_mamba1_kernel():
+    if not mx.metal.is_available():
+        return None
+    source = R"""
+        // Per-step Mamba v1 SSM forward (seq_len == 1).
+        // Template symbols:
+        //   D  : channel dim (intermediate_size)
+        //   Ds : state dim
+        //   T  : threads per channel (= 32)
+        // Grid: (T, D, B)
+        auto b = thread_position_in_grid.z;
+        auto d_idx = thread_position_in_grid.y;    // channel in [0, D)
+        auto lane = thread_position_in_threadgroup.x; // 0..T-1
+
+        constexpr int T = 32;
+        constexpr int n_per_lane = (Ds + T - 1) / T; // ceil
+
+        // Pointers are laid out as:
+        //   X:         (B, 1, D)          -> X[b, 0, d]
+        //   A_log:     (D, Ds)            -> A_log[d, s]
+        //   B, C:      (B, D, Ds)         -> B[b, d, s], C[b, d, s]
+        //   delta:     (B, D)             -> delta[b, d]
+        //   state_in:  (B, D, Ds)         -> state_in[b, d, s]
+
+        // Base offsets
+        auto X_bd = X + (b * D + d_idx);           // scalar at seq_len==1
+        auto A_d  = A_log + (d_idx * Ds);          // row pointer
+        auto B_bd = B + ((b * D + d_idx) * Ds);
+        auto C_bd = C + ((b * D + d_idx) * Ds);
+        auto S_bd = state_in + ((b * D + d_idx) * Ds);
+        auto O_bd = state_out + ((b * D + d_idx) * Ds);
+        auto Y_bd = out + (b * D + d_idx);         // scalar output
+
+        float x = static_cast<float>(*X_bd);
+        float dlt = static_cast<float>(delta[b * D + d_idx]);
+        float acc = 0.0f;
+
+        for (int i = 0; i < n_per_lane; ++i) {
+            int s = lane + i * T;
+            if (s >= Ds) break;
+            float A = -fast::exp(static_cast<float>(A_d[s]));
+            float dA = fast::exp(dlt * A);
+            float new_state = dA * static_cast<float>(S_bd[s])
+                            + (dlt * x) * static_cast<float>(B_bd[s]);
+            O_bd[s] = static_cast<TYPE>(new_state);
+            acc += new_state * static_cast<float>(C_bd[s]);
+        }
+
+        acc = simd_sum(acc);
+        if (thread_index_in_simdgroup == 0) {
+            // y = acc + D[d] * x
+            float Dd = static_cast<float>(Dvec[d_idx]);
+            *Y_bd = static_cast<TYPE>(acc + Dd * x);
+        }
+    """;
+    return mx.fast.metal_kernel(
+        name="mamba1_ssm_step_kernel",
+        input_names=["X", "A_log", "B", "C", "Dvec", "delta", "state_in"],
+        output_names=["out", "state_out"],
+        source=source,
+    )
+
+
 _ssm_kernel = make_ssm_kernel()
+_mamba1_kernel = make_mamba1_kernel()
 
 
 def ssm_update_kernel(
@@ -196,3 +260,64 @@ def ssm_update(
         state,
         time_step_limit,
     )
+
+
+def ssm_v1_step(
+    x: mx.array,
+    A_log: mx.array,
+    B: mx.array,
+    C: mx.array,
+    D: mx.array,
+    delta: mx.array,
+    state: Optional[mx.array] = None,
+):
+    b, _, d = x.shape
+    ds = A_log.shape[-1]
+
+    x_ = x.reshape(b, d)
+    A = -mx.exp(A_log)
+    dA = mx.exp(delta[..., None] * A)
+
+    inp = (delta * x_)[..., None]
+    if state is None:
+        prev = mx.zeros((b, d, ds), dtype=x.dtype)
+    else:
+        prev = state
+    new_state = prev * dA + inp * B
+
+    y = (new_state * C).sum(axis=-1) + D.reshape(1, d) * x_
+    y = y.reshape(b, 1, d)
+    return y, new_state
+
+
+def ssm_v1_update(
+    hidden_states: mx.array,
+    A_log: mx.array,
+    B: mx.array,
+    C: mx.array,
+    D: mx.array,
+    delta: mx.array,
+    state: Optional[mx.array] = None,
+):
+    b, l, d = hidden_states.shape
+    assert l == 1, "ssm_v1_update expects seq_len == 1"
+
+    if (
+        mx.default_device() == mx.gpu
+        and mx.metal.is_available()
+        and _mamba1_kernel is not None
+    ):
+        input_type = hidden_states.dtype
+        ds = A_log.shape[-1]
+        if state is None:
+            state = mx.zeros((b, d, ds), dtype=input_type)
+        out, new_state = _mamba1_kernel(
+            inputs=[hidden_states.reshape(b, d), A_log, B, C, D, delta, state],
+            template=[("TYPE", input_type), ("D", d), ("Ds", ds)],
+            grid=(32, d, b),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(b, d), (b, d, ds)],
+            output_dtypes=[input_type, input_type],
+        )
+        return out.reshape(b, 1, d), new_state
+    return ssm_v1_step(hidden_states, A_log, B, C, D, delta, state)

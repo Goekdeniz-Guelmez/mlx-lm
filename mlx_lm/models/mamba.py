@@ -8,6 +8,7 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs
 from .cache import MambaCache
+from .ssm import ssm_v1_update
 
 
 @dataclass
@@ -113,11 +114,15 @@ class MambaBlock(nn.Module):
         if self.use_bcdt_rms:
             delta, B, C = map(self.mixer_norm, (delta, B, C))
         delta = nn.softplus(self.dt_proj(delta))
-        new_state = mx.expand_dims(delta * x, -1) * mx.expand_dims(B, 1)
-        if state is not None:
-            new_state += state * mx.exp(mx.expand_dims(delta, -1) * A)
-        y = (new_state @ mx.expand_dims(C, -1)).squeeze(2)
-        y = y + D * x
+        # Expand shared B/C (B, Ds) -> (B, D, Ds) to match kernel expectations
+        B_exp = mx.repeat(B[:, None, :], self.intermediate_size, axis=1)
+        C_exp = mx.repeat(C[:, None, :], self.intermediate_size, axis=1)
+        x_reshaped = x.reshape(x.shape[0], 1, self.intermediate_size)
+
+        y, new_state = ssm_v1_update(
+            x_reshaped, self.A_log, B_exp, C_exp, D, delta, state
+        )
+        y = y.squeeze(1)
         return y, new_state
 
     def _process_sequence(self, x, conv_cache, state_cache):
@@ -152,7 +157,7 @@ class MambaBlock(nn.Module):
             x, conv_cache, state_cache
         )
 
-        if isinstance(cache, MambaCache):
+        if cache is not None:
             cache[0] = new_conv_cache
             cache[1] = new_state_cache
 
