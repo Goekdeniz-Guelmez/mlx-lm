@@ -114,7 +114,7 @@ def make_mamba1_kernel():
             float Dd = static_cast<float>(Dvec[d_idx]);
             *Y_bd = static_cast<TYPE>(acc + Dd * x);
         }
-    """;
+    """
     return mx.fast.metal_kernel(
         name="mamba1_ssm_step_kernel",
         input_names=["X", "A_log", "B", "C", "Dvec", "delta", "state_in"],
