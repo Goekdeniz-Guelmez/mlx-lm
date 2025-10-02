@@ -21,6 +21,8 @@ class ModelArgs(BaseModelArgs):
     num_attention_heads: int
     rms_norm_eps: float
     vocab_size: int
+    grid_size: int = 5
+    spline_order: int = 3
     head_dim: Optional[int] = None
     max_position_embeddings: Optional[int] = None
     num_key_value_heads: Optional[int] = None
@@ -104,41 +106,31 @@ class Attention(nn.Module):
 class MLP(nn.Module):  
     def __init__(self, args: ModelArgs):  
         super().__init__()  
-  
-        dim = args.hidden_size  
-        hidden_dim = args.intermediate_size
-        
-        # Get KAN-specific parameters with defaults
-        grid_size = getattr(args, 'grid_size', 5)
-        spline_order = getattr(args, 'spline_order', 3)
-        mlp_bias = getattr(args, 'mlp_bias', False)
-        
-        # Replace Linear layers with KANLinear layers
         self.gate_proj = KANLinear(
-            in_features=dim,
-            out_features=hidden_dim,
-            grid_size=grid_size,
-            spline_order=spline_order,
+            in_features=args.hidden_size,
+            out_features=args.intermediate_size,
+            grid_size=args.grid_size,
+            spline_order=args.spline_order,
             base_activation=nn.SiLU(),
-            bias=mlp_bias
+            bias=args.mlp_bias
         )
         
         self.down_proj = KANLinear(
-            in_features=hidden_dim,
-            out_features=dim,
-            grid_size=grid_size,
-            spline_order=spline_order,
+            in_features=args.intermediate_size,
+            out_features=args.hidden_size,
+            grid_size=args.grid_size,
+            spline_order=args.spline_order,
             base_activation=nn.SiLU(),
-            bias=mlp_bias
+            bias=args.mlp_bias
         )
         
         self.up_proj = KANLinear(
-            in_features=dim,
-            out_features=hidden_dim,
-            grid_size=grid_size,
-            spline_order=spline_order,
+            in_features=args.hidden_size,
+            out_features=args.intermediate_size,
+            grid_size=args.grid_size,
+            spline_order=args.spline_order,
             base_activation=nn.SiLU(),
-            bias=mlp_bias
+            bias=args.mlp_bias
         )
   
     def __call__(self, x: mx.array) -> mx.array:  
