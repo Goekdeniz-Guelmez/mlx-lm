@@ -9,6 +9,7 @@ import mlx.nn as nn
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
+from .kan import KANLinear
 
 
 @dataclass
@@ -100,23 +101,59 @@ class Attention(nn.Module):
         return self.o_proj(output)
 
 
-class MLP(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-
-        dim = args.hidden_size
+class MLP(nn.Module):  
+    def __init__(self, args: ModelArgs):  
+        super().__init__()  
+  
+        dim = args.hidden_size  
         hidden_dim = args.intermediate_size
-        if hasattr(args, "mlp_bias"):
-            mlp_bias = args.mlp_bias
-        else:
-            mlp_bias = False
-
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=mlp_bias)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=mlp_bias)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=mlp_bias)
-
-    def __call__(self, x) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        
+        # Get KAN-specific parameters with defaults
+        grid_size = getattr(args, 'grid_size', 5)
+        spline_order = getattr(args, 'spline_order', 3)
+        mlp_bias = getattr(args, 'mlp_bias', False)
+        
+        # Replace Linear layers with KANLinear layers
+        self.gate_proj = KANLinear(
+            in_features=dim,
+            out_features=hidden_dim,
+            grid_size=grid_size,
+            spline_order=spline_order,
+            base_activation=nn.SiLU(),
+            bias=mlp_bias
+        )
+        
+        self.down_proj = KANLinear(
+            in_features=hidden_dim,
+            out_features=dim,
+            grid_size=grid_size,
+            spline_order=spline_order,
+            base_activation=nn.SiLU(),
+            bias=mlp_bias
+        )
+        
+        self.up_proj = KANLinear(
+            in_features=dim,
+            out_features=hidden_dim,
+            grid_size=grid_size,
+            spline_order=spline_order,
+            base_activation=nn.SiLU(),
+            bias=mlp_bias
+        )
+  
+    def __call__(self, x: mx.array) -> mx.array:  
+        return self.down_proj(self.gate_proj(x) * self.up_proj(x))
+    
+    def regularization_loss(
+        self, 
+        regularize_activation: float = 1.0, 
+        regularize_entropy: float = 1.0
+    ) -> mx.array:
+        return (
+            self.gate_proj.regularization_loss(regularize_activation, regularize_entropy) +
+            self.down_proj.regularization_loss(regularize_activation, regularize_entropy) +
+            self.up_proj.regularization_loss(regularize_activation, regularize_entropy)
+        )
 
 
 class TransformerBlock(nn.Module):
