@@ -7,7 +7,7 @@ from typing import Dict
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as opt
-from mlx.utils import tree_flatten, tree_unflatten
+from mlx.utils import tree_flatten, tree_map_with_path, tree_unflatten
 
 from ..models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 from .dora import DoRAEmbedding, DoRALinear
@@ -81,92 +81,23 @@ def linear_to_lora_layers(
             dropout=config["dropout"],
         )
 
-    keys = config.get("keys", None)
-    if keys is not None:
-        keys = set(keys)
-    elif model.model_type in [
-        "mistral",
-        "mistral3",
-        "llama",
-        "phi",
-        "mixtral",
-        "nemotron",
-        "stablelm",
-        "hunyuan",
-        "qwen2",
-        "qwen2_moe",
-        "qwen3",
-        "qwen3_moe",
-        "phimoe",
-        "gemma",
-        "gemma2",
-        "gemma3",
-        "gemma3_text",
-        "granite",
-        "helium",
-        "starcoder2",
-        "cohere",
-        "cohere2",
-        "minicpm",
-        "minicpm3",
-        "minicpm4",
-        "deepseek",
-        "olmo2",
-        "olmoe",
-        "internlm3",
-        "glm4",
-        "mimo",
-    ]:
-        keys = set(["self_attn.q_proj", "self_attn.v_proj"])
-        if model.model_type in ["mixtral", "phimoe"]:
-            keys.add("block_sparse_moe.gate")
-        if model.model_type == "qwen2_moe":
-            keys.add("mlp.gate")
-            keys.add("mlp.shared_expert_gate")
-        if model.model_type in ["olmoe", "qwen3_moe"]:
-            keys.add("mlp.gate")
+    if (keys := config.get("keys", None)) is None:
+        keys = set()
 
-    elif model.model_type == "gpt_bigcode":
-        keys = set(["attn.c_attn"])
-    elif model.model_type == "gpt2":
-        keys = set(["attn.c_attn"])
-    elif model.model_type == "gpt_neox":
-        keys = set(["attention.query_key_value"])
-    elif model.model_type == "olmo":
-        keys = set(["att_proj"])
-    elif model.model_type == "openelm":
-        keys = set(["attn.qkv_proj"])
-    elif model.model_type == "phi3":
-        keys = set(["self_attn.qkv_proj"])
-    elif model.model_type == "phi-msft":
-        keys = set(["mixer.Wqkv", "moe.gate"])
-    elif model.model_type == "dbrx":
-        keys = set(["norm_attn_norm.attn.Wqkv", "ffn.router.layer"])
-    elif model.model_type == "internlm2":
-        keys = set(["attention.wqkv", "attention.wo"])
-    elif model.model_type == "deepseek_v2" or model.model_type == "minicpm3":
-        keys = set(
-            [
-                "self_attn.q_proj",
-                "self_attn.q_a_proj",
-                "self_attn.q_b_proj",
-                "self_attn.kv_a_proj_with_mqa",
-                "self_attn.kv_b_proj",
-            ]
-        )
-    elif model.model_type == "mamba":
-        keys = set(
-            [
-                "mixer.in_proj",
-                "mixer.x_proj",
-                "mixer.dt_proj",
-                "mixer.out_proj",
-            ]
-        )
-    elif model.model_type == "exaone":
-        keys = set(["attn.attention.q_proj", "attn.attention.v_proj"])
-    else:
-        raise ValueError(f"Lora does not support {model.model_type}")
+        def get_keys_for_lora(p, m):
+            types = (
+                nn.Linear,
+                nn.QuantizedLinear,
+                SwitchLinear,
+                QuantizedSwitchLinear,
+                nn.Embedding,
+                nn.QuantizedEmbedding,
+            )
+            if hasattr(m, "to_lora") or isinstance(m, types):
+                keys.add(p)
+
+        for l in model.layers:
+            l.apply_to_modules(get_keys_for_lora)
 
     for l in model.layers[-max(num_layers, 0) :]:
         lora_layers = [(k, to_lora(m)) for k, m in l.named_modules() if k in keys]
@@ -216,39 +147,36 @@ def dequantize(model: nn.Module) -> nn.Module:
     Returns:
         nn.Module: The model with dequantized layers.
     """
-    de_quantize_layers = []
+    dequantize_layers = []
     for name, module in model.named_modules():
+        bias = "bias" in module
         if isinstance(module, nn.QuantizedLinear):
-            bias = "bias" in module
-            weight = module.weight
-            weight = mx.dequantize(
-                weight,
-                module.scales,
-                module.biases,
-                module.group_size,
-                module.bits,
-            ).astype(mx.float16)
-            output_dims, input_dims = weight.shape
-            linear = nn.Linear(input_dims, output_dims, bias=bias)
-            linear.weight = weight
-            if bias:
-                linear.bias = module.bias
-            de_quantize_layers.append((name, linear))
-        if isinstance(module, nn.QuantizedEmbedding):
-            weight = mx.dequantize(
-                module.weight,
-                module.scales,
-                module.biases,
-                module.group_size,
-                module.bits,
-            ).astype(mx.float16)
-            num_embeddings, dims = weight.shape
-            emb = nn.Embedding(num_embeddings, dims)
-            emb.weight = weight
-            de_quantize_layers.append((name, emb))
+            cls = nn.Linear
+            kwargs = {"bias": bias}
+        elif isinstance(module, nn.QuantizedEmbedding):
+            kwargs = {}
+            cls = nn.Embedding
+        elif isinstance(module, QuantizedSwitchLinear):
+            kwargs = {"bias": bias}
+            cls = SwitchLinear
+        else:
+            continue
+        weight = mx.dequantize(
+            module.weight,
+            module.scales,
+            module.biases,
+            module.group_size,
+            module.bits,
+        )
+        args = weight.shape[::-1]
+        m = cls(*args, **kwargs)
+        if bias:
+            m.bias = module.bias
+        m.weight = weight
+        dequantize_layers.append((name, m))
 
-    if len(de_quantize_layers) > 0:
-        model.update_modules(tree_unflatten(de_quantize_layers))
+    if len(dequantize_layers) > 0:
+        model.update_modules(tree_unflatten(dequantize_layers))
     return model
 
 

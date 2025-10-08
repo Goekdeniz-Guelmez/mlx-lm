@@ -118,10 +118,9 @@ class DeepseekMLP(nn.Module):
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = nn.silu
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class MoEGate(nn.Module):
@@ -211,14 +210,13 @@ class DeepseekModel(nn.Module):
         self,
         x: mx.array,
         cache: Optional[Any] = None,
-        mask: Optional[mx.array] = None,
     ) -> mx.array:
         h = self.embed_tokens(x)
-        if mask is None:
-            mask = create_attention_mask(h, cache)
 
         if cache is None:
             cache = [None] * len(self.layers)
+
+        mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -238,9 +236,8 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
-        mask: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache, mask)
+        out = self.model(inputs, cache)
         return self.lm_head(out)
 
     def sanitize(self, weights):

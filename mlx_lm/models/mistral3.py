@@ -31,9 +31,11 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache=None,
-        mask: Optional[mx.array] = None,
+        input_embeddings: Optional[mx.array] = None,
     ):
-        return self.language_model(inputs, cache=cache, mask=mask)
+        return self.language_model(
+            inputs, cache=cache, input_embeddings=input_embeddings
+        )
 
     def sanitize(self, weights):
         weights = tree_unflatten(list(weights.items()))

@@ -105,10 +105,9 @@ class MLP(nn.Module):
         self.v1 = nn.Linear(d_model, ffn_dim, bias=False)
         self.w1 = nn.Linear(d_model, ffn_dim, bias=False)
         self.w2 = nn.Linear(ffn_dim, d_model, bias=False)
-        self.act_fn = nn.silu
 
     def __call__(self, x: mx.array) -> mx.array:
-        current_hidden_states = self.act_fn(self.w1(x)) * self.v1(x)
+        current_hidden_states = nn.silu(self.w1(x)) * self.v1(x)
         current_hidden_states = self.w2(current_hidden_states)
         return current_hidden_states
 
@@ -197,16 +196,14 @@ class DBRX(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
         h = self.wte(inputs)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.blocks)
+
+        mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.blocks, cache):
             h = layer(h, mask, c)
@@ -225,10 +222,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        out = self.transformer(inputs, mask, cache)
+        out = self.transformer(inputs, cache)
         return self.lm_head(out)
 
     @property

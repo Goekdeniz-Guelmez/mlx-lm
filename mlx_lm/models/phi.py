@@ -111,10 +111,9 @@ class PhiMLP(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.act = nn.GELU(approx="precise")
 
     def __call__(self, x) -> mx.array:
-        return self.fc2(self.act(self.fc1(x)))
+        return self.fc2(nn.gelu_approx(self.fc1(x)))
 
 
 class PhiDecoderLayer(nn.Module):
@@ -142,14 +141,12 @@ class PhiModel(nn.Module):
             config.hidden_size, eps=config.layer_norm_eps
         )
 
-    def __call__(self, x, mask, cache):
+    def __call__(self, x, cache):
         x = self.embed_tokens(x)
-
-        if mask is None:
-            mask = create_attention_mask(x, cache)
 
         if cache is None:
             cache = [None] * len(self.layers)
+        mask = create_attention_mask(x, cache[0])
 
         for layer, c in zip(self.layers, cache):
             x = layer(x, mask, c)
@@ -167,10 +164,9 @@ class Model(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        mask: mx.array = None,
         cache=None,
     ) -> mx.array:
-        y = self.model(x, mask, cache)
+        y = self.model(x, cache)
         return self.lm_head(y)
 
     @property

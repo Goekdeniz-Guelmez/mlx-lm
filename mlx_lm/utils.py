@@ -27,9 +27,7 @@ if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
     try:
         from modelscope import snapshot_download
     except ImportError:
-        raise ImportError(
-            "Please run `pip install modelscope` to activate the ModelScope."
-        )
+        raise ImportError("Run `pip install modelscope` to use ModelScope.")
 else:
     from huggingface_hub import snapshot_download
 
@@ -43,9 +41,12 @@ from .tuner.utils import get_total_parameters, load_adapters
 
 # Constants
 MODEL_REMAPPING = {
-    "mistral": "llama",  # mistral is compatible with llama
+    "mistral": "llama",
+    "llava": "mistral3",
     "phi-msft": "phixtral",
     "falcon_mamba": "mamba",
+    "kimi_k2": "deepseek_v3",
+    "qwen2_5_vl": "qwen2_vl",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -81,7 +82,7 @@ def compute_bits_per_weight(model):
     return model_bytes * 8 / model_params
 
 
-def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
+def _download(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
     it is downloaded from the Hugging Face Hub.
@@ -91,7 +92,7 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
         revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
 
     Returns:
-        Path: The path to the model.
+        Path: The local file path.
     """
     model_path = Path(path_or_hf_repo)
 
@@ -102,7 +103,7 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
                 revision=revision,
                 allow_patterns=[
                     "*.json",
-                    "*.safetensors",
+                    "model*.safetensors",
                     "*.py",
                     "tokenizer.model",
                     "*.tiktoken",
@@ -113,7 +114,12 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
                 ],
             )
         )
+
     return model_path
+
+
+def hf_repo_to_path(hf_repo):
+    return Path(snapshot_download(hf_repo, local_files_only=True))
 
 
 def load_config(model_path: Path) -> dict:
@@ -132,7 +138,7 @@ def load_model(
     strict: bool = True,
     model_config: dict = {},
     get_model_classes: Callable[[dict], Tuple[Type[nn.Module], Type]] = _get_classes,
-) -> nn.Module:
+) -> Tuple[nn.Module, dict]:
     """
     Load and initialize the model from a given path.
 
@@ -150,7 +156,7 @@ def load_model(
             Defaults to the ``_get_classes`` function.
 
     Returns:
-        nn.Module: The loaded and initialized model.
+        Tuple[nn.Module, dict[str, Any]]: The loaded and initialized model and config.
 
     Raises:
         FileNotFoundError: If the weight files (.safetensors) are not found.
@@ -160,10 +166,6 @@ def load_model(
     config.update(model_config)
 
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
-
-    if not weight_files:
-        # Try weight for back-compat
-        weight_files = glob.glob(str(model_path / "weight*.safetensors"))
 
     if not weight_files and strict:
         logging.error(f"No safetensors found in {model_path}")
@@ -181,23 +183,38 @@ def load_model(
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
-    if (quantization := config.get("quantization", None)) is not None:
-
+    def _quantize(quantization):
         def class_predicate(p, m):
             # Handle custom per layer quantizations
             if p in config["quantization"]:
                 return config["quantization"][p]
             if not hasattr(m, "to_quantized"):
                 return False
-            # Handle legacy models which may not have everything quantized
             return f"{p}.scales" in weights
 
         nn.quantize(
             model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
+            mode=quantization.get("mode", "affine"),
             class_predicate=class_predicate,
         )
+
+    if (quantization := config.get("quantization", None)) is not None:
+        _quantize(quantization)
+
+    elif quantization_config := config.get("quantization_config", False):
+        # Handle legacy quantization config
+        quant_method = quantization_config["quant_method"]
+        if quant_method == "bitnet":
+            from .models.bitlinear_layers import bitnet_quantize
+
+            model = bitnet_quantize(model, quantization_config)
+        elif quant_method == "mxfp4":
+            quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
 
     model.load_weights(list(weights.items()), strict=strict)
 
@@ -214,7 +231,12 @@ def load(
     model_config={},
     adapter_path: Optional[str] = None,
     lazy: bool = False,
-) -> Tuple[nn.Module, TokenizerWrapper]:
+    return_config: bool = False,
+    revision: str = None,
+) -> Union[
+    Tuple[nn.Module, TokenizerWrapper],
+    Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]],
+]:
     """
     Load the model and tokenizer from a given path or a huggingface repository.
 
@@ -229,16 +251,19 @@ def load(
         lazy (bool): If ``False`` eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
+        return_config (bool: If ``True`` return the model config as the last item..
+        revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
     Returns:
-        Tuple[nn.Module, TokenizerWrapper]: A tuple containing the loaded model and tokenizer.
+        Union[Tuple[nn.Module, TokenizerWrapper], Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]]:
+            A tuple containing the loaded model, tokenizer and, if requested, the model config.
 
     Raises:
         FileNotFoundError: If config file or safetensors are not found.
         ValueError: If model class or args class are not found.
     """
-    model_path = get_model_path(path_or_hf_repo)
+    model_path = _download(path_or_hf_repo, revision=revision)
 
-    model, config = load_model(model_path, lazy)
+    model, config = load_model(model_path, lazy, model_config=model_config)
     if adapter_path is not None:
         model = load_adapters(model, adapter_path)
         model.eval()
@@ -246,17 +271,10 @@ def load(
         model_path, tokenizer_config, eos_token_ids=config.get("eos_token_id", None)
     )
 
-    return model, tokenizer
-
-
-def fetch_from_hub(
-    model_path: Path, lazy: bool = False
-) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
-    model, config = load_model(model_path, lazy)
-    tokenizer = load_tokenizer(
-        model_path, eos_token_ids=config.get("eos_token_id", None)
-    )
-    return model, config, tokenizer
+    if return_config:
+        return model, tokenizer, config
+    else:
+        return model, tokenizer
 
 
 def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list:
@@ -283,24 +301,28 @@ def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list
     return shards
 
 
-def create_model_card(path: Union[str, Path], hf_path: Union[str, Path]):
+def create_model_card(path: Union[str, Path], hf_path: Union[str, Path, None]):
     """
     Uploads the model to Hugging Face hub.
 
     Args:
         path (Union[str, Path]): Local path to the model.
-        hf_path (Union[str, Path]): Path to the original Hugging Face model.
+        hf_path (Union[str, Path, None]): Path to the original Hugging Face model.
     """
-    from huggingface_hub import ModelCard
+    from huggingface_hub import ModelCard, ModelCardData
 
-    card = ModelCard.load(hf_path)
+    if hf_path is None:
+        card = ModelCard.from_template(ModelCardData(language="en"))
+    else:
+        card = ModelCard.load(hf_path)
     card.data.library_name = "mlx"
     card.data.pipeline_tag = "text-generation"
     if card.data.tags is None:
         card.data.tags = ["mlx"]
     elif "mlx" not in card.data.tags:
         card.data.tags += ["mlx"]
-    card.data.base_model = str(hf_path)
+    if hf_path is not None:
+        card.data.base_model = str(hf_path)
     card.text = ""
     card.save(os.path.join(path, "README.md"))
 
@@ -320,15 +342,22 @@ def upload_to_hub(path: str, upload_repo: str):
     logging.set_verbosity_info()
     card_path = Path(path) / "README.md"
     card = ModelCard.load(card_path)
-    hf_path = card.data.base_model
-    card.text = dedent(
-        f"""
-        # {upload_repo}
 
+    hf_path = card.data.base_model
+
+    if hf_path is not None:
+        provenance = f"""
         This model [{upload_repo}](https://huggingface.co/{upload_repo}) was
         converted to MLX format from [{hf_path}](https://huggingface.co/{hf_path})
         using mlx-lm version **{__version__}**.
+        """
+    else:
+        provenance = ""
 
+    card.text = dedent(
+        f"""
+        # {upload_repo}
+        {provenance}
         ## Use with mlx
 
         ```bash
@@ -427,45 +456,60 @@ def save_model(
 def quantize_model(
     model: nn.Module,
     config: dict,
-    q_group_size: int,
-    q_bits: int,
-    quant_predicate: Optional[
-        Callable[[str, nn.Module, dict], Union[bool, dict]]
-    ] = None,
-) -> Tuple:
+    group_size: int,
+    bits: int,
+    mode: str = "affine",
+    quant_predicate: Optional[Callable[[str, nn.Module], Union[bool, dict]]] = None,
+) -> Tuple[nn.Module, dict]:
     """
     Applies quantization to the model weights.
 
     Args:
         model (nn.Module): The model to be quantized.
         config (dict): Model configuration.
-        q_group_size (int): Group size for quantization.
-        q_bits (int): Bits per weight for quantization.
-        quant_predicate (Callable): A callable that decides how
-            to quantize each layer based on the path.
-            Accepts the layer `path`, the `module` and the model `config`.
-            Returns either a bool to signify quantize/no quantize or
-            a dict of quantization parameters to pass to `to_quantized`.
+        group_size (int): Group size for quantization.
+        bits (int): Bits per weight for quantization.
+        mode (str): The quantization mode.
+        quant_predicate (Callable): A callable that decides how to quantize
+          each layer based on the path. Accepts the layer `path` and the
+          `module`. Returns either a bool to signify quantize/no quantize or
+          a dict of quantization parameters to pass to `to_quantized`.
 
     Returns:
         Tuple: Tuple containing quantized model and config.
     """
-    if "quantization" in config:
-        raise ValueError("Cannot quantize already quantized model")
     quantized_config = copy.deepcopy(config)
-    quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
 
-    # Add any custom quantization parameters to the config as we go
-    def _class_predicate(p, m):
-        bool_or_params = quant_predicate(p, m, config)
-        quantized_config["quantization"][p] = bool_or_params
+    quant_predicate = quant_predicate or getattr(model, "quant_predicate", None)
+    quant_params = {"group_size": group_size, "bits": bits, "mode": mode}
+    if "quantization" in quantized_config:
+        # If the model is already partially quantized, return params so that
+        # the config is set on a per-layer basis
+        fine_grained_config = True
+    else:
+        fine_grained_config = False
+        quantized_config["quantization"] = quant_params
+
+    def wrapped_predicate(path, module):
+        if not hasattr(module, "to_quantized"):
+            return False
+        if module.weight.shape[-1] % group_size != 0:
+            return False
+        bool_or_params = True
+        if quant_predicate is not None:
+            bool_or_params = quant_predicate(path, module)
+        if isinstance(bool_or_params, dict):
+            quantized_config["quantization"][path] = bool_or_params
+        elif fine_grained_config and bool_or_params:
+            quantized_config["quantization"][path] = quant_params
         return bool_or_params
 
     nn.quantize(
         model,
-        q_group_size,
-        q_bits,
-        class_predicate=_class_predicate if quant_predicate else None,
+        group_size,
+        bits,
+        mode=mode,
+        class_predicate=wrapped_predicate,
     )
     # support hf model tree #957
     quantized_config["quantization_config"] = quantized_config["quantization"]
@@ -491,6 +535,8 @@ def save_config(
     # Clean unused keys
     config.pop("_name_or_path", None)
     config.pop("vision_config", None)
+    if "quantization" in config:
+        config["quantization_config"] = config["quantization"]
 
     # sort the config for better readability
     config = dict(sorted(config.items()))
@@ -502,14 +548,20 @@ def save_config(
 
 def save(
     dst_path: Union[str, Path],
-    src_path: Union[str, Path],
+    src_path_or_repo: Union[str, Path],
     model: nn.Module,
     tokenizer: TokenizerWrapper,
     config: Dict[str, Any],
-    hf_repo: Optional[str] = None,
     donate_model: bool = True,
 ):
-    src_path = Path(src_path)
+
+    src_path = Path(src_path_or_repo)
+    if not src_path.exists():
+        hf_repo = src_path_or_repo
+        src_path = hf_repo_to_path(hf_repo)
+    else:
+        hf_repo = None
+
     dst_path = Path(dst_path)
     save_model(dst_path, model, donate_model=True)
     save_config(config, config_path=dst_path / "config.json")
@@ -519,8 +571,7 @@ def save(
         for file in glob.glob(str(src_path / p)):
             shutil.copy(file, dst_path)
 
-    if hf_repo is not None:
-        create_model_card(dst_path, hf_repo)
+    create_model_card(dst_path, hf_repo)
 
 
 def common_prefix_len(list1, list2):

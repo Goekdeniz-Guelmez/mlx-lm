@@ -24,6 +24,7 @@ class TestTokenizers(unittest.TestCase):
                     "tokenizer_config.json",
                     "special_tokens_map.json",
                     "tokenizer.model",
+                    "chat_template.jinja",
                 ],
             )
         )
@@ -45,6 +46,9 @@ class TestTokenizers(unittest.TestCase):
             self.assertEqual(text, expected_text)
 
         tokens = tokenizer.encode("こんにちは！私の名前はAI")
+        check(tokens)
+
+        tokens = tokenizer.encode("⊕ ⊻ ∧ ¬")
         check(tokens)
 
         tokens = tokenizer.encode("a ,b")
@@ -93,6 +97,24 @@ class TestTokenizers(unittest.TestCase):
         detokenizer.finalize()
 
         self.assertEqual(detokenizer.last_segment, tokenizer.eos_token)
+
+    def test_tool_calling(self):
+        tokenizer_repo = "mlx-community/Qwen3-4B-4bit"
+        tokenizer = self.download_tokenizer(tokenizer_repo)
+        self.assertTrue(tokenizer.has_tool_calling)
+        self.assertEqual(tokenizer.tool_call_start, "<tool_call>")
+        self.assertEqual(tokenizer.tool_call_end, "</tool_call>")
+
+        tokenizer_repo = "mlx-community/Llama-3.2-1B-Instruct-4bit"
+        tokenizer = self.download_tokenizer(tokenizer_repo)
+        self.assertFalse(tokenizer.has_tool_calling)
+
+    def test_thinking(self):
+        tokenizer_repo = "mlx-community/Qwen3-4B-4bit"
+        tokenizer = self.download_tokenizer(tokenizer_repo)
+        self.assertTrue(tokenizer.has_thinking)
+        self.assertEqual(tokenizer.think_start, "<think>")
+        self.assertEqual(tokenizer.think_end, "</think>")
 
 
 if __name__ == "__main__":

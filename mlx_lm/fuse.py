@@ -6,8 +6,7 @@ from mlx.utils import tree_flatten, tree_unflatten
 from .gguf import convert_to_gguf
 from .tuner.utils import dequantize, load_adapters
 from .utils import (
-    fetch_from_hub,
-    get_model_path,
+    load,
     save,
     upload_to_hub,
 )
@@ -32,12 +31,6 @@ def parse_arguments() -> argparse.Namespace:
         type=str,
         default="adapters",
         help="Path to the trained adapter weights and config.",
-    )
-    parser.add_argument(
-        "--hf-path",
-        type=str,
-        default=None,
-        help="Path to the original Hugging Face model. Required for upload if --model is a local directory.",
     )
     parser.add_argument(
         "--upload-repo",
@@ -68,11 +61,9 @@ def main() -> None:
     print("Loading pretrained model")
     args = parse_arguments()
 
-    model_path = get_model_path(args.model)
-    model, config, tokenizer = fetch_from_hub(model_path)
-
-    model.freeze()
-    model = load_adapters(model, args.adapter_path)
+    model, tokenizer, config = load(
+        args.model, adapter_path=args.adapter_path, return_config=True
+    )
 
     fused_linears = [
         (n, m.fuse(de_quantize=args.de_quantize))
@@ -89,14 +80,12 @@ def main() -> None:
         config.pop("quantization", None)
 
     save_path = Path(args.save_path)
-    hf_path = args.hf_path or (args.model if not Path(args.model).exists() else None)
     save(
         save_path,
-        model_path,
+        args.model,
         model,
         tokenizer,
         config,
-        hf_repo=hf_path,
         donate_model=False,
     )
 
@@ -107,13 +96,9 @@ def main() -> None:
                 f"Model type {model_type} not supported for GGUF conversion."
             )
         weights = dict(tree_flatten(model.parameters()))
-        convert_to_gguf(model_path, weights, config, str(save_path / args.gguf_path))
+        convert_to_gguf(save_path, weights, config, str(save_path / args.gguf_path))
 
     if args.upload_repo is not None:
-        if hf_path is None:
-            raise ValueError(
-                "Must provide original Hugging Face repo to upload local model."
-            )
         upload_to_hub(args.save_path, args.upload_repo)
 
 

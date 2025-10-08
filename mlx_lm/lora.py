@@ -3,6 +3,7 @@ import math
 import os
 import re
 import types
+import warnings
 from pathlib import Path
 
 import mlx.core as mx
@@ -11,7 +12,7 @@ import mlx.optimizers as optim
 import numpy as np
 import yaml
 
-from .tuner.callbacks import WandBCallback
+from .tuner.callbacks import get_reporting_callbacks
 from .tuner.datasets import CacheDataset, load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
@@ -39,15 +40,18 @@ yaml_loader.add_implicit_resolver(
 )
 
 CONFIG_DEFAULTS = {
-    "model": "mlx_model",
+    "model": "Qwen/Qwen3-0.6b",
     "train": False,
     "fine_tune_type": "lora",
     "optimizer": "adam",
     "optimizer_config": {
         "adam": {},
         "adamw": {},
+        "muon": {},
+        "sgd": {},
+        "adafactor": {},
     },
-    "data": "data/",
+    "data": "mlx-community/WikiSQL",
     "seed": 0,
     "num_layers": 16,
     "batch_size": 4,
@@ -67,7 +71,8 @@ CONFIG_DEFAULTS = {
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 20.0},
     "mask_prompt": False,
-    "wandb": None,
+    "report_to": None,
+    "project_name": None,
 }
 
 
@@ -103,9 +108,9 @@ def build_parser():
     parser.add_argument(
         "--optimizer",
         type=str,
-        choices=["adam", "adamw"],
+        choices=["adam", "adamw", "muon", "sgd", "adafactor"],
         default=None,
-        help="Optimizer to use for training: adam or adamw",
+        help="Optimizer to use for training: adam, adamw, sgd, or adafactor.",
     )
     parser.add_argument(
         "--mask-prompt",
@@ -180,10 +185,16 @@ def build_parser():
         default=None,
     )
     parser.add_argument(
-        "--wandb",
+        "--report-to",
         type=str,
         default=None,
-        help="WandB project name to report training metrics. Disabled if None.",
+        help="Services to report logs to ('wandb', 'swanlab', or 'wandb,swanlab').",
+    )
+    parser.add_argument(
+        "--project-name",
+        type=str,
+        default=None,
+        help="Project name for logging. Defaults to the name of the root directory.",
     )
     parser.add_argument("--seed", type=int, help="The PRNG seed")
     return parser
@@ -251,11 +262,16 @@ def train_model(
 
     optimizer_name = args.optimizer.lower()
     optimizer_config = args.optimizer_config.get(optimizer_name, {})
-
     if optimizer_name == "adam":
         opt_class = optim.Adam
     elif optimizer_name == "adamw":
         opt_class = optim.AdamW
+    elif optimizer_name == "muon":
+        opt_class = optim.Muon
+    elif optimizer_name == "sgd":
+        opt_class = optim.SGD
+    elif optimizer_name == "adafactor":
+        opt_class = optim.Adafactor
     else:
         raise ValueError(f"Unsupported optimizer: {optimizer_name}")
 
@@ -288,17 +304,15 @@ def evaluate_model(args, model: nn.Module, test_set):
 
 def run(args, training_callback: TrainingCallback = None):
     np.random.seed(args.seed)
-
-    if args.wandb is not None:
-        training_callback = WandBCallback(
-            project_name=args.wandb,
-            log_dir=args.adapter_path,
-            config=vars(args),
-            wrapped_callback=training_callback,
-        )
+    training_callback = get_reporting_callbacks(
+        args.report_to,
+        project_name=args.project_name,
+        log_dir=args.adapter_path,
+        config=vars(args),
+    )
 
     print("Loading pretrained model")
-    model, tokenizer = load(args.model)
+    model, tokenizer = load(args.model, tokenizer_config={"trust_remote_code": True})
 
     print("Loading datasets")
     train_set, valid_set, test_set = load_dataset(args, tokenizer)

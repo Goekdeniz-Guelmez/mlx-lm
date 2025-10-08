@@ -89,8 +89,9 @@ class NaiveStreamingDetokenizer(StreamingDetokenizer):
     def text(self):
         if self._current_tokens:
             self._current_text = self._tokenizer.decode(self._current_tokens)
-            if (
+            if self._current_text.endswith("\ufffd") or (
                 self._tokenizer.clean_up_tokenization_spaces
+                and len(self._current_text) > 0
                 and self._current_text[-1] == " "
             ):
                 self._current_text = self._current_text[:-1]
@@ -202,7 +203,7 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
 
     def add_token(self, token):
         self.tokens.append(token)
-        v = self.tokenmap[token]
+        v = self.tokenmap[token] if token < len(self.tokenmap) else "!"
         self._unflushed += v
         text = self._decode_bytes(self._unflushed)
 
@@ -261,12 +262,32 @@ class TokenizerWrapper:
         self, tokenizer, detokenizer_class=NaiveStreamingDetokenizer, eos_token_ids=None
     ):
         self._tokenizer = tokenizer
-        self._detokenizer = detokenizer_class(tokenizer)
+        self._detokenizer_class = detokenizer_class
         self._eos_token_ids = (
             set(eos_token_ids)
             if eos_token_ids is not None
             else {tokenizer.eos_token_id}
         )
+        self._think_start = None
+        self._think_end = None
+        self._tool_call_start = None
+        self._tool_call_end = None
+
+        THINK_TOKENS = [("<think>", "</think>")]
+        TOOL_CALL_TOKENS = [("<tool_call>", "</tool_call>")]
+
+        vocab = tokenizer.get_vocab()
+        for think_start, think_end in THINK_TOKENS:
+            if think_start in vocab and think_end in vocab:
+                self._think_start = think_start
+                self._think_end = think_end
+                break
+        if tokenizer.chat_template and '"tool"' in tokenizer.chat_template:
+            for tool_call_start, tool_call_end in TOOL_CALL_TOKENS:
+                if tool_call_start in vocab and tool_call_end in vocab:
+                    self._tool_call_start = tool_call_start
+                    self._tool_call_end = tool_call_end
+                    break
 
     def add_eos_token(self, token: str):
         token_id = None
@@ -279,6 +300,37 @@ class TokenizerWrapper:
             raise ValueError(f"'{token}' is not a token for this tokenizer")
 
         self._eos_token_ids.add(token_id)
+
+    @property
+    def has_thinking(self):
+        return self._think_start is not None
+
+    @property
+    def think_start(self):
+        return self._think_start
+
+    @property
+    def think_end(self):
+        return self._think_end
+
+    @property
+    def has_tool_calling(self):
+        return self._tool_call_start is not None
+
+    @property
+    def tool_call_start(self):
+        return self._tool_call_start
+
+    @property
+    def tool_call_end(self):
+        return self._tool_call_end
+
+    @property
+    def detokenizer(self):
+        """
+        Get a stateful streaming detokenizer.
+        """
+        return self._detokenizer_class(self)
 
     def __getattr__(self, attr):
         if attr == "detokenizer":
