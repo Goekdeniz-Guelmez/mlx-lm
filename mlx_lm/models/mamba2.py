@@ -231,7 +231,7 @@ class Model(nn.Module):
             logits = self.lm_head(hidden)
         return logits
 
-    def make_cache(self, batch_size: int = 1) -> list[MambaCache]:
+    def make_cache(self) -> list[MambaCache]:
         return [MambaCache() for _ in range(self.args.num_hidden_layers)]
 
     @property
