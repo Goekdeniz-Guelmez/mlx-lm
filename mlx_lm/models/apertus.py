@@ -1,4 +1,4 @@
-# Copyright © 2023-2025 Apple Inc.
+# Copyright © 2025 Apple Inc.
 
 from typing import Any, Dict, Optional, Union
 from dataclasses import dataclass
