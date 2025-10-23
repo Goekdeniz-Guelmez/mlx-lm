@@ -1,8 +1,8 @@
 # Copyright © 2023-2025 Apple Inc.
 
+from typing import Any, Dict, Optional, Union
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -27,13 +27,14 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float
     post_norm: bool
     qk_norm: bool
+    head_dim: Optional[int] = None
     tie_word_embeddings: bool
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
 
 
 @partial(mx.compile, shapeless=True)
-def xielu(x, alpha_p, alpha_n, beta, eps):
+def xielu(x, alpha_p, alpha_n, beta, eps) -> mx.array:
     alpha_p = nn.softplus(alpha_p)
     alpha_n = beta + nn.softplus(alpha_n)
     return mx.where(
@@ -85,7 +86,7 @@ class ApertusAttention(nn.Module):
         self.num_attention_heads = args.num_attention_heads
         self.num_key_value_heads = args.num_key_value_heads
 
-        self.head_dim = args.hidden_size // args.num_attention_heads
+        self.head_dim = args.hidden_size // args.num_attention_heads if args.head_dim is None else args.head_dim
         self.scale = self.head_dim**-0.5
 
         self.q_proj = nn.Linear(
