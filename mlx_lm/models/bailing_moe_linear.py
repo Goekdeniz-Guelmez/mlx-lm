@@ -317,10 +317,11 @@ def group_expert_select(
     norm_topk_prob: bool,
     score_function: str,
 ) -> Tuple[mx.array, mx.array]:
+    in_type = gates.dtype
     if score_function == "sigmoid":
-        scores = mx.sigmoid(gates)
+        scores = mx.sigmoid(gates.astype(mx.float32))
     else:
-        scores = mx.softmax(gates, axis=-1, precise=True)
+        scores = mx.softmax(gates.astype(mx.float32), axis=-1)
     orig_scores = scores
     if e_score_correction_bias is not None:
         scores = scores + e_score_correction_bias
@@ -342,7 +343,7 @@ def group_expert_select(
         scores = scores / denominator
     scores = scores * routed_scaling_factor
 
-    return inds, scores
+    return inds, scores.astype(in_type)
 
 
 class BailingMoeLinearGate(nn.Module):
