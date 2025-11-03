@@ -63,11 +63,12 @@ class BailingMoeLinearV2GroupRMSNorm(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
+        dtype = x.dtype
         shape = x.shape
         group_shape = shape[:-1] + (self.groups, shape[-1] // self.groups)
         x = mx.reshape(x, group_shape).astype(mx.float32)
         x = x * mx.rsqrt(mx.mean(mx.square(x), axis=-1, keepdims=True) + self.eps)
-        return self.weight * mx.reshape(x, shape)
+        return (self.weight * mx.reshape(x, shape)).astype(dtype)
 
 
 class BailingMoeLinearMLP(nn.Module):
@@ -316,11 +317,10 @@ def group_expert_select(
     norm_topk_prob: bool,
     score_function: str,
 ) -> Tuple[mx.array, mx.array]:
-    in_type = gates.dtype
     if score_function == "sigmoid":
-        scores = mx.sigmoid(gates.astype(mx.float32))
+        scores = mx.sigmoid(gates)
     else:
-        scores = mx.softmax(gates.astype(mx.float32), axis=-1)
+        scores = mx.softmax(gates, axis=-1, precise=True)
     orig_scores = scores
     if e_score_correction_bias is not None:
         scores = scores + e_score_correction_bias
@@ -342,7 +342,7 @@ def group_expert_select(
         scores = scores / denominator
     scores = scores * routed_scaling_factor
 
-    return inds, scores.astype(in_type)
+    return inds, scores
 
 
 class BailingMoeLinearGate(nn.Module):

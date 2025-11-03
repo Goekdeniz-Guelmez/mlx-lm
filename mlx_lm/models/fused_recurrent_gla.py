@@ -50,11 +50,11 @@ def _make_fused_recurrent_gla_kernel():
                 float q_scaled_bf16 = (float)(InT)q_scaled_f32;
                 acc += q_scaled_bf16 * h_col[d];
             }
-            y[y_off + dv] = acc;
+            y[y_off + dv] = (InT)acc;
         }
 
         for (int d = 0; d < Dk; ++d) {
-            state_out[state_base + d * Dv] = h_col[d];
+            state_out[state_base + d * Dv] = (InT)h_col[d];
         }
     """
     inputs = ["q", "k", "v", "g", "B", "H_in", "T", "scale", "state_in"]
@@ -165,6 +165,6 @@ def fused_recurrent_gla_update(
         grid=(1, Dv, B * H),
         threadgroup=(1, 1, 1),
         output_shapes=[(B, H, T, Dv), (B, H, Dk, Dv)],
-        output_dtypes=[mx.float32, mx.float32],
+        output_dtypes=[input_type, input_type],
     )
     return y, new_state
