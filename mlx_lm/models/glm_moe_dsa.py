@@ -8,9 +8,7 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
 from .base import BaseModelArgs, create_attention_mask
-from .cache import CacheList, KVCache
-from .deepseek_v32 import DeepseekV32Attention
-from .glm4_moe_lite import Glm4MoeLiteMLP, Glm4MoeLiteMoE
+from .glm4_moe_lite import Glm4MoeLiteAttention, Glm4MoeLiteMLP, Glm4MoeLiteMoE
 from .pipeline import PipelineMixin
 
 
@@ -49,16 +47,13 @@ class ModelArgs(BaseModelArgs):
     partial_rotary_factor: float = 1.0
     tie_word_embeddings: bool = False
     num_nextn_predict_layers: int = 1
-    index_head_dim: int = 128
-    index_n_heads: int = 32
-    index_topk: int = 2048
     quantization: Optional[Dict[str, Any]] = None
 
 
 class Glm4MoeDSADecoderLayer(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__()
-        self.self_attn = DeepseekV32Attention(config)
+        self.self_attn = Glm4MoeLiteAttention(config)
         use_moe = (
             config.n_routed_experts is not None
             and layer_idx >= config.first_k_dense_replace
@@ -105,9 +100,7 @@ class Glm4MoeDSAModel(PipelineMixin, nn.Module):
 
         if cache is None:
             cache = [None] * len(self.pipeline_layers)
-        mask = create_attention_mask(
-            h, cache[0][0] if cache[0] else None, return_array=True
-        )
+        mask = create_attention_mask(h, cache[0], return_array=True)
 
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
@@ -118,7 +111,7 @@ class Glm4MoeDSAModel(PipelineMixin, nn.Module):
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
             if cache[-1] is not None:
-                cache[-1][0].keys = mx.depends(cache[-1][0].keys, h)
+                cache[-1].keys = mx.depends(cache[-1].keys, h)
 
         if pipeline_size > 1:
             h = mx.distributed.all_gather(h)[: h.shape[0]]
@@ -143,12 +136,14 @@ class Model(nn.Module):
         return self.lm_head(out)
 
     def sanitize(self, weights):
-        # Remove multi-token prediction layers
+        # Remove multi-token prediction layers and indexer weights
         mpt_layer = self.args.num_hidden_layers
         new_weights = {}
         for k, v in weights.items():
             parts = k.split(".")
             if len(parts) >= 3 and parts[1] == "layers" and int(parts[2]) >= mpt_layer:
+                continue
+            if "indexer" in k:
                 continue
             new_weights[k] = v
         weights = new_weights
@@ -271,6 +266,3 @@ class Model(nn.Module):
             return "e_score_correction_bias" not in k
 
         return predicate
-
-    def make_cache(self):
-        return [CacheList(KVCache(), KVCache()) for _ in self.layers]
