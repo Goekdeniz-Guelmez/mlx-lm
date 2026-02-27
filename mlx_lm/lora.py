@@ -326,11 +326,14 @@ def run(args, training_callback: TrainingCallback = None):
     train_set, valid_set, test_set = load_dataset(args, tokenizer)
 
     if args.epochs is not None:
-        args.iters = calculate_training_steps(
+        args.iters, steps_per_epoch = calculate_training_steps(
             num_samples=len(train_set),
             batch_size=args.batch_size,
             epochs=args.epochs,
-            grad_accum_steps=1,
+        )
+        print(
+            f"Using epochs={args.epochs} with steps_per_epoch={steps_per_epoch}; "
+            f"resolved to iters={args.iters}."
         )
 
     if args.test and not args.train:

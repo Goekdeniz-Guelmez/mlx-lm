@@ -16,8 +16,8 @@ from .lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear
 
 
 def calculate_training_steps(
-    num_samples: int, batch_size: int, epochs: int, grad_accum_steps: int = 1
-) -> int:
+    num_samples: int, batch_size: int, epochs: int
+) -> tuple[int, int]:
     """
     Calculates the total effective training steps (TERS) from the given epoch.
 
@@ -25,13 +25,22 @@ def calculate_training_steps(
         num_samples (int): The length of the training dataset.
         batch_size (int): The batch size used during training.
         epochs (int): The current epoch number.
-        grad_accum_steps (int): Number of gradient accumulation steps before one optimizer update. Default is 1.
 
     Returns:
         int: The total effective training steps.
+        int: Number of steps per epoch
     """
-    batches_per_epoch = math.ceil(num_samples / batch_size)
-    return (epochs * batches_per_epoch) // grad_accum_steps
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+    if epochs <= 0:
+        raise ValueError("epochs must be greater than 0.")
+    steps_per_epoch = num_samples // batch_size
+    if steps_per_epoch < 1:
+        raise ValueError(
+            f"Dataset must have at least batch_size={batch_size} "
+            f"examples but only has {num_samples}."
+        )
+    return max(1, math.ceil(epochs * steps_per_epoch)), steps_per_epoch
 
 
 def build_schedule(schedule_config: Dict):

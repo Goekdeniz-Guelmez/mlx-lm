@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import mlx.nn as nn
 
 from mlx_lm.tuner.lora import LoRALinear
-from mlx_lm.tuner.utils import print_trainable_parameters
+from mlx_lm.tuner.utils import print_trainable_parameters, calculate_training_steps
 
 
 class TestTunerUtils(unittest.TestCase):
@@ -80,6 +80,23 @@ class TestTunerUtils(unittest.TestCase):
         expected_output = "Trainable parameters: 50.000% (3.000M/6.000M)\n"
         print_trainable_parameters(model)
         self.assertEqual(self.capturedOutput.getvalue(), expected_output)
+
+class TestLoraEpochs(unittest.TestCase):
+    def test_resolve_train_iterations_with_epochs(self):
+        iters, steps_per_epoch = calculate_training_steps(num_samples=10, batch_size=4, epochs=2)
+        self.assertEqual(iters, 4)
+        self.assertEqual(steps_per_epoch, 2)
+
+    def test_resolve_train_iterations_rejects_invalid_epochs(self):
+        with self.assertRaisesRegex(ValueError, "epochs must be greater than 0"):
+            calculate_training_steps(num_samples=100, batch_size=4, epochs=0)
+
+    def test_resolve_train_iterations_rejects_too_small_dataset(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "Dataset must have at least batch_size=4 examples but only has 3",
+        ):
+            calculate_training_steps(num_samples=3, batch_size=4, epochs=1)
 
 
 if __name__ == "__main__":
