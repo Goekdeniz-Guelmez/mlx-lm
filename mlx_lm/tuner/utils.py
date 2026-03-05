@@ -28,7 +28,7 @@ def calculate_training_steps(
 
     Returns:
         int: The total effective training steps.
-        int: Number of steps per epoch
+        int: Number of steps per epoch.
     """
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
