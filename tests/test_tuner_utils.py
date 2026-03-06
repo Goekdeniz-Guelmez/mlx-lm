@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import mlx.nn as nn
 
 from mlx_lm.tuner.lora import LoRALinear
-from mlx_lm.tuner.utils import print_trainable_parameters, calculate_training_steps
+from mlx_lm.tuner.utils import calculate_training_steps, print_trainable_parameters
 
 
 class TestTunerUtils(unittest.TestCase):
@@ -81,9 +81,12 @@ class TestTunerUtils(unittest.TestCase):
         print_trainable_parameters(model)
         self.assertEqual(self.capturedOutput.getvalue(), expected_output)
 
+
 class TestLoraEpochs(unittest.TestCase):
     def test_resolve_train_iterations_with_epochs(self):
-        iters, steps_per_epoch = calculate_training_steps(num_samples=10, batch_size=4, epochs=2)
+        iters, steps_per_epoch = calculate_training_steps(
+            num_samples=10, batch_size=4, epochs=2
+        )
         self.assertEqual(iters, 4)
         self.assertEqual(steps_per_epoch, 2)
 
