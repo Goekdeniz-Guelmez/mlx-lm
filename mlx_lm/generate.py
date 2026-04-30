@@ -470,6 +470,239 @@ def generate_step(
         n += 1
 
 
+def mtp_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 2048,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+    prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
+    """
+    A generator producing token ids using Multi-Token Prediction (MTP) heads
+    for self-speculative decoding.
+
+    If the model exposes a ``get_mtp_heads()`` method it is used as an
+    internal draft.  Accepted extra tokens are yielded with ``from_draft=True``
+    while the verification token has ``from_draft=False``.  Falls back to
+    standard single-token generation when no MTP heads are available.
+
+    The model must also expose ``model_backbone(inputs, cache)`` that returns
+    ``(hidden_state, logits)`` so that MTP heads can operate on the hidden
+    state without an extra forward pass.
+
+    Args:
+        prompt (mx.array): The input prompt.
+        model (nn.Module): The model with optional MTP heads.
+        max_tokens (int): Maximum tokens to generate. Default: ``256``.
+        sampler: Token sampler. Default: ``None`` (greedy).
+        logits_processors: Optional list of logits processors.
+        prompt_cache: Optional pre-computed prompt cache.
+        prefill_step_size (int): Chunk size for prompt prefill.
+        kv_bits: KV-cache quantisation bits. Default: ``None``.
+        kv_group_size: KV-cache quantisation group size. Default: ``64``.
+        quantized_kv_start: Step to start KV quantisation. Default: ``0``.
+        prompt_progress_callback: Progress callback ``(processed, total)``.
+
+    Yields:
+        Tuple[mx.array, mx.array, bool]: token, log-probabilities, from_draft.
+    """
+    mtp_heads = model.get_mtp_heads() if hasattr(model, "get_mtp_heads") else []
+    has_backbone = hasattr(model, "model_backbone")
+
+    # If no MTP support, fall back to standard generation
+    if not mtp_heads or not has_backbone:
+        for token, logprobs in generate_step(
+            prompt,
+            model,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            logits_processors=logits_processors,
+            prompt_cache=prompt_cache,
+            prefill_step_size=prefill_step_size,
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
+            quantized_kv_start=quantized_kv_start,
+            prompt_progress_callback=prompt_progress_callback,
+        ):
+            yield token, logprobs, False
+        return
+
+    num_mtp = len(mtp_heads)
+
+    if prompt_cache is None:
+        prompt_cache = cache.make_prompt_cache(model)
+
+    if not cache.can_trim_prompt_cache(prompt_cache):
+        # Hybrid SSM models (e.g. Qwen3.5) use non-trimmable caches; fall
+        # back gracefully to standard autoregressive generation.
+        for token, logprobs in generate_step(
+            prompt,
+            model,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            logits_processors=logits_processors,
+            prompt_cache=prompt_cache,
+            prefill_step_size=prefill_step_size,
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
+            quantized_kv_start=quantized_kv_start,
+            prompt_progress_callback=prompt_progress_callback,
+        ):
+            yield token, logprobs, False
+        return
+
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+
+    quantize_cache_fn = functools.partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
+
+    tokens = None  # accumulated token context for logits processors
+
+    prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
+
+    def _process_and_sample(toks, logits):
+        nonlocal tokens
+        if logits_processors:
+            tokens = (
+                mx.concatenate([tokens, toks]) if tokens is not None else toks
+            )
+            for processor in logits_processors:
+                logits = processor(tokens, logits)
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        y = sampler(logprobs)
+        return y, logprobs.squeeze(0)
+
+    def _prefill(y):
+        total = y.size
+        processed = 0
+        prompt_progress_callback(processed, total)
+        while total - processed > 1:
+            n = min(prefill_step_size, total - processed - 1)
+            model.model_backbone(y[:n][None], prompt_cache)
+            quantize_cache_fn(prompt_cache)
+            mx.eval([c.state for c in prompt_cache])
+            y = y[n:]
+            processed += n
+            prompt_progress_callback(processed, total)
+            mx.clear_cache()
+        return y
+
+    def _backbone_step(y):
+        """One backbone forward → (hidden, logits, sampled_token, logprobs)."""
+        with mx.stream(generation_stream):
+            hidden, logits = model.model_backbone(y[None], prompt_cache)
+            logits = logits[:, -1, :]
+            quantize_cache_fn(prompt_cache)
+            tok, lp = _process_and_sample(y, logits)
+        return hidden[:, -1:, :], tok, lp  # hidden: (1,1,D)
+
+    # Resolve embedding lookup: prefer model.model.embed_tokens, then
+    # model.embed_tokens, otherwise fall back to a zero tensor (MTP heads
+    # that bundle their own embedding module can ignore the argument).
+    _embed_fn = None
+    for _attr in ("model", None):
+        _obj = getattr(model, _attr) if _attr else model
+        if hasattr(_obj, "embed_tokens") and callable(_obj.embed_tokens):
+            _embed_fn = _obj.embed_tokens
+            break
+
+    def _get_embed(tok):
+        if _embed_fn is not None:
+            return _embed_fn(tok.reshape(1, 1))  # always (1, 1, D)
+        return mx.zeros((1, 1, 1))  # head must handle this case itself
+
+    def _mtp_draft(hidden, accepted_tok):
+        """Run MTP heads to produce draft tokens."""
+        draft_toks = []
+        draft_lps = []
+        h = hidden  # (1,1,D)
+        for head in mtp_heads:
+            embed = _get_embed(accepted_tok)
+            with mx.stream(generation_stream):
+                logits, h = head(h, embed)
+                logits = logits[:, -1, :] if logits.ndim == 3 else logits
+                d_tok, d_lp = _process_and_sample(accepted_tok, logits)
+            mx.async_eval(d_tok)
+            draft_toks.append(d_tok)
+            draft_lps.append(d_lp)
+            accepted_tok = d_tok
+        return draft_toks, draft_lps
+
+    with mx.stream(generation_stream):
+        y = _prefill(prompt)
+
+    ntoks = 0
+    hidden, y, logprobs = _backbone_step(y)
+    mx.async_eval(y, logprobs)
+
+    try:
+        while True:
+            if ntoks == max_tokens:
+                break
+
+            # Yield the verified backbone token
+            mx.eval(y)
+            cur_y = y.item()
+            cur_lp = logprobs
+            ntoks += 1
+            yield cur_y, cur_lp, False
+
+            if ntoks == max_tokens:
+                break
+
+            # Generate draft tokens via MTP heads
+            num_draft = min(num_mtp, max_tokens - ntoks)
+            draft_toks, draft_lps = _mtp_draft(hidden, y)
+            draft_toks = draft_toks[:num_draft]
+            draft_lps = draft_lps[:num_draft]
+
+            # Verify all draft tokens in one backbone pass by running them
+            # through the backbone sequentially (one at a time so KV cache
+            # stays consistent).  Each accepted draft token yields immediately.
+            n_accepted = 0
+            for dt, dlp in zip(draft_toks, draft_lps):
+                mx.eval(dt)
+                # Run backbone on the draft token to get verified logits
+                ver_hidden, ver_y, ver_lp = _backbone_step(dt)
+
+                mx.eval(ver_y)
+                if ver_y.item() == dt.item():
+                    # Accepted
+                    ntoks += 1
+                    n_accepted += 1
+                    yield dt.item(), dlp, True
+                    hidden = ver_hidden
+                    y = ver_y
+                    logprobs = ver_lp
+                    if ntoks == max_tokens:
+                        break
+                else:
+                    # Rejected — trim cache back for the rejected step
+                    cache.trim_prompt_cache(prompt_cache, 1)
+                    # Use the backbone's corrected token
+                    hidden = ver_hidden
+                    y = ver_y
+                    logprobs = ver_lp
+                    break
+
+            if ntoks % 256 == 0:
+                mx.clear_cache()
+
+    finally:
+        pass
+
+
 def speculative_generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -700,11 +933,17 @@ def stream_generate(
 
     if draft_model is None:
         kwargs.pop("num_draft_tokens", None)
-        token_generator = generate_step(prompt, model, **kwargs)
-        # from_draft always false for non-speculative generation
-        token_generator = (
-            (token, logprobs, False) for token, logprobs in token_generator
-        )
+        # Auto-detect MTP support: use MTP self-speculative decoding when the
+        # model has both ``get_mtp_heads()`` and ``model_backbone()``.
+        if hasattr(model, "get_mtp_heads") and hasattr(model, "model_backbone"):
+            kwargs.pop("max_kv_size", None)
+            token_generator = mtp_generate_step(prompt, model, **kwargs)
+        else:
+            token_generator = generate_step(prompt, model, **kwargs)
+            # from_draft always false for non-speculative generation
+            token_generator = (
+                (token, logprobs, False) for token, logprobs in token_generator
+            )
     else:
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)

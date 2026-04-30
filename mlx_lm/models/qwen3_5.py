@@ -10,6 +10,7 @@ from mlx.utils import tree_map
 
 from .base import (
     BaseModelArgs,
+    MTPHead,
     create_attention_mask,
     create_ssm_mask,
 )
@@ -41,6 +42,7 @@ class TextModelArgs(BaseModelArgs):
     attention_bias: bool = False
     head_dim: Optional[int] = None
     full_attention_interval: int = 4
+    mtp_num_hidden_layers: int = 1
 
     # MoE fields (optional, for Qwen3_5MoeForConditionalGeneration)
     num_experts: int = 0
@@ -206,6 +208,87 @@ class GatedDeltaNet(nn.Module):
         return out
 
 
+class MTPDecoderLayer(nn.Module):
+    def __init__(self, args: TextModelArgs):
+        super().__init__()
+        self.self_attn = Attention(args)
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.mlp = MLP(args.hidden_size, args.intermediate_size)
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        h = x + r
+        out = h + self.mlp(self.post_attention_layernorm(h))
+        return out
+
+
+class MTPModule(MTPHead):
+    """
+    Qwen3.5 Multi-Token Prediction head.
+
+    Implements the ``MTPHead`` protocol so the generation engine picks it up
+    automatically via ``get_mtp_heads()``.
+
+    The head fuses the backbone hidden state with the embedding of the
+    most-recently accepted token (Qwen 3.5 order: [embedding, hidden]),
+    runs one or more decoder layers, and returns logits + the updated
+    hidden state for chaining to the next MTP head.
+    """
+
+    def __init__(self, args: TextModelArgs, embed_tokens: nn.Embedding, lm_head):
+        super().__init__()
+        self.embed_tokens = embed_tokens
+        self.lm_head = lm_head
+        self._tie = args.tie_word_embeddings
+        self.pre_fc_norm_hidden = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.pre_fc_norm_embedding = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.fc = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
+        self.transformer_layers = [MTPDecoderLayer(args) for _ in range(args.mtp_num_hidden_layers)]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+    def __call__(
+        self,
+        hidden_state: mx.array,
+        token_embed: mx.array,
+        cache: Optional[Any] = None,
+    ):
+        """
+        Args:
+            hidden_state: ``(1, 1, hidden_size)`` – last backbone hidden state.
+            token_embed:  ``(1, 1, hidden_size)`` – embedding of the accepted token.
+            cache: Optional list of KV-cache entries for this head's layers.
+
+        Returns:
+            logits: ``(1, vocab_size)``
+            next_hidden: ``(1, 1, hidden_size)`` for chaining to the next head.
+        """
+        # Qwen 3.5 fusion order: [embedding, hidden]
+        e = self.pre_fc_norm_embedding(token_embed)
+        h = self.pre_fc_norm_hidden(hidden_state)
+        fused = self.fc(mx.concatenate([e, h], axis=-1))
+
+        cache_list = cache if cache is not None else [None] * len(self.transformer_layers)
+        for layer, c in zip(self.transformer_layers, cache_list):
+            fused = layer(fused, mask=None, cache=c)
+
+        next_hidden = self.norm(fused)  # (1, 1, D)
+
+        if self._tie:
+            logits = self.embed_tokens.as_linear(next_hidden[:, -1, :])
+        else:
+            logits = self.lm_head(next_hidden[:, -1, :])  # (1, vocab)
+
+        return logits, next_hidden
+
+
 class DecoderLayer(nn.Module):
     def __init__(self, args: TextModelArgs, layer_idx: int):
         super().__init__()
@@ -256,6 +339,7 @@ class Qwen3_5TextModel(nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        return_hidden: bool = False,
     ) -> mx.array:
         if input_embeddings is not None:
             hidden_states = input_embeddings
@@ -272,7 +356,10 @@ class Qwen3_5TextModel(nn.Module):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
 
-        return self.norm(hidden_states)
+        normed = self.norm(hidden_states)
+        if return_hidden:
+            return normed, normed  # both logit-input and MTP hidden are the normed state
+        return normed
 
 
 class TextModel(nn.Module):
@@ -289,12 +376,26 @@ class TextModel(nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        return_hidden: bool = False,
     ) -> mx.array:
-        out = self.model(inputs, cache, input_embeddings=input_embeddings)
+        res = self.model(
+            inputs,
+            cache,
+            input_embeddings=input_embeddings,
+            return_hidden=return_hidden,
+        )
+        if return_hidden:
+            out, h = res
+        else:
+            out = res
+
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
+
+        if return_hidden:
+            return out, h
         return out
 
     @property
@@ -310,7 +411,10 @@ class TextModel(nn.Module):
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
         should_shift_norm_weights = has_mtp_weights or has_unsanitized_conv1d
-        weights = {k: v for k, v in weights.items() if "mtp." not in k}
+
+        # Strip MTP weights only when no MTP heads have been instantiated.
+        if not getattr(self, "_has_mtp", False):
+            weights = {k: v for k, v in weights.items() if "mtp." not in k}
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -321,6 +425,9 @@ class TextModel(nn.Module):
             "model.norm.weight",
             ".q_norm.weight",
             ".k_norm.weight",
+            ".pre_fc_norm_hidden.weight",
+            ".pre_fc_norm_embedding.weight",
+            "mtp.norm.weight",
         )
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
@@ -356,6 +463,7 @@ class TextModel(nn.Module):
 class ModelArgs(BaseModelArgs):
     model_type: str
     text_config: dict
+    mtp_num_hidden_layers: int = 0  # Default to 0
 
     @classmethod
     def from_dict(cls, params):
@@ -371,6 +479,17 @@ class Model(nn.Module):
         self.model_type = args.model_type
         self.language_model = TextModel(TextModelArgs.from_dict(args.text_config))
 
+        mtp_layers = getattr(TextModelArgs.from_dict(args.text_config), "mtp_num_hidden_layers", 0)
+        if mtp_layers > 0:
+            t_args = TextModelArgs.from_dict(args.text_config)
+            lm = self.language_model
+            lm_head = None if t_args.tie_word_embeddings else lm.lm_head
+            # One MTPModule per extra predicted token (currently always 1)
+            self._mtp_heads = [
+                MTPModule(t_args, lm.model.embed_tokens, lm_head)
+            ]
+            self.language_model._has_mtp = True
+
     def __call__(
         self,
         inputs: mx.array,
@@ -378,15 +497,35 @@ class Model(nn.Module):
         input_embeddings: Optional[mx.array] = None,
     ):
         return self.language_model(
-            inputs, cache=cache, input_embeddings=input_embeddings
+            inputs,
+            cache=cache,
+            input_embeddings=input_embeddings,
         )
+
+    def model_backbone(
+        self,
+        inputs: mx.array,
+        cache=None,
+        input_embeddings: Optional[mx.array] = None,
+    ):
+        """Returns ``(hidden_state, logits)`` for MTP inference."""
+        # TextModel returns (logits, hidden) when return_hidden=True
+        logits, hidden = self.language_model(
+            inputs,
+            cache=cache,
+            input_embeddings=input_embeddings,
+            return_hidden=True,
+        )
+        return hidden, logits
+
+    def get_mtp_heads(self) -> List[MTPHead]:
+        """Exposes MTP heads for the generation engine."""
+        return getattr(self, "_mtp_heads", [])
 
     def sanitize(self, weights):
         sanitized = {}
         for key, value in weights.items():
             if key.startswith("vision_tower") or key.startswith("model.visual"):
-                continue
-            if key.startswith("model.visual"):
                 continue
             if key.startswith("model.language_model"):
                 key = key.replace("model.language_model", "language_model.model")
@@ -395,7 +534,26 @@ class Model(nn.Module):
             else:
                 key = "language_model." + key
             sanitized[key] = value
-        return self.language_model.sanitize(sanitized)
+
+        remapped = {}
+        for k, v in sanitized.items():
+            new_k = k
+            for pfx in (
+                "language_model.model.mtp.",
+                "language_model.mtp.",
+                "mtp.",
+            ):
+                if k.startswith(pfx):
+                    rest = k[len(pfx):]          # e.g. "0.enorm.weight"
+                    parts = rest.split(".", 1)   # ["0", "enorm.weight"]
+                    if len(parts) == 2 and parts[0].isdigit():
+                        idx = parts[0]
+                        tail = parts[1]
+                        new_k = f"_mtp_heads.{idx}.{tail}"
+                    break
+            remapped[new_k] = v
+
+        return self.language_model.sanitize(remapped)
 
     def shard(self, group=None):
         group = group or mx.distributed.init()

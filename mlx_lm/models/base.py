@@ -1,10 +1,12 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import inspect
+from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx.utils import tree_map
 
 
@@ -18,6 +20,58 @@ class BaseModelArgs:
                 for k, v in params.items()
                 if k in inspect.signature(cls).parameters
             }
+        )
+
+
+class MTPHead(nn.Module):
+    """
+    Base class for Multi-Token Prediction (MTP) heads.
+
+    Models that support MTP inference should implement this interface and
+    expose a ``get_mtp_heads()`` method on their ``Model`` class that returns
+    a list of ``MTPHead`` instances (one per extra predicted token).
+
+    Each head receives the last hidden state produced by the backbone and the
+    embedding of the *just-accepted* token, and returns logits over the
+    vocabulary for the *next* token.
+
+    Convention for model authors
+    -----------------------------
+    1. Implement the ``__call__`` method below.
+    2. On the top-level ``Model`` class add::
+
+           def get_mtp_heads(self) -> List["MTPHead"]:
+               return self.mtp_heads   # whatever attribute holds the heads
+
+    The generation engine will call ``get_mtp_heads()`` automatically; no
+    other changes are required.
+    """
+
+    @abstractmethod
+    def __call__(
+        self,
+        hidden_state: mx.array,
+        token_embed: mx.array,
+        cache: Optional[Any] = None,
+    ) -> Tuple[mx.array, mx.array]:
+        """
+        Predict the next token from the current hidden state.
+
+        Args:
+            hidden_state: Last hidden state from the backbone,
+                shape ``(1, 1, hidden_size)``.
+            token_embed: Embedding of the most-recently accepted token,
+                shape ``(1, 1, hidden_size)``.
+            cache: Optional KV-cache entry for this head.
+
+        Returns:
+            Tuple of:
+                - ``logits``: shape ``(1, vocab_size)``
+                - ``next_hidden``: updated hidden state passed to the next
+                  MTP head, shape ``(1, 1, hidden_size)``.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement __call__(hidden_state, token_embed, cache)"
         )
 
 
